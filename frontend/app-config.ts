@@ -33,36 +33,34 @@ export interface AppConfig {
 }
 
 export const APP_CONFIG_DEFAULTS: AppConfig = {
-  companyName: 'Murf AI',
-  pageTitle: 'Voice Agent Starter',
-  pageDescription: 'A voice agent powered by Murf Falcon — the fastest TTS API',
+  companyName: 'BazaarMitra',
+  pageTitle: 'BazaarMitra — Voice-Powered Local Shopping',
+  pageDescription: 'Talk naturally. Discover local products and stores near you.',
 
   supportsChatInput: true,
-  supportsVideoInput: true,
-  supportsScreenShare: true,
+  // BazaarMitra is a voice-first local-commerce assistant — no camera/screen
+  // share needed for this product, so these are turned off through the
+  // existing config flags (AgentControlBar already respects them) rather
+  // than by deleting any working camera/screen-share code.
+  supportsVideoInput: false,
+  supportsScreenShare: false,
   isPreConnectBufferEnabled: true,
 
+  // NOTE: left pointing at the existing LiveKit logo files on purpose.
+  // opengraph-image.tsx has special-case logic keyed off filenames
+  // containing "lk-logo" (for wordmark lookup); swap these once real
+  // BazaarMitra logo assets exist in /public and opengraph-image.tsx has
+  // been checked against them.
   logo: '/murf-logo.svg',
-  accent: '#6366F1',
   logoDark: '/murf-logo-dark.svg',
-  accentDark: '#818cf8',
-  startButtonText: 'Start talking',
 
-  // optional: audio visualization configuration
-  // audioVisualizerType: 'bar',
-  // audioVisualizerColor: '#002cf2',
-  // audioVisualizerColorDark: '#1fd5f9',
-  // audioVisualizerColorShift: 0.3,
-  // audioVisualizerBarCount: 5,
-  // audioVisualizerType: 'radial',
-  // audioVisualizerRadialBarCount: 24,
-  // audioVisualizerRadialRadius: 100,
-  // audioVisualizerType: 'grid',
-  // audioVisualizerGridRowCount: 25,
-  // audioVisualizerGridColumnCount: 25,
-  // audioVisualizerType: 'wave',
-  // audioVisualizerWaveLineWidth: 3,
-  // audioVisualizerType: 'aura',
+  accent: '#2563EB',
+  accentDark: '#3B82F6',
+  startButtonText: 'Start conversation',
+
+  // audio visualization configuration
+  audioVisualizerType: 'bar',
+  audioVisualizerBarCount: 5,
 
   // agent dispatch configuration
   agentName: process.env.AGENT_NAME ?? undefined,

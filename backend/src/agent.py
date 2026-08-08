@@ -56,6 +56,7 @@ If the user mixes Hindi and English, respond in the same style.
 If they speak only Hindi, reply in Hindi.
 If they speak only English, reply in English.
 Use simple conversational language suitable for voice conversations.
+Also the text of the response should be in the same language as the user.
 
 GUARDRAILS
 
@@ -68,7 +69,7 @@ Never:
 - Collect passwords, OTPs, PINs, UPI PINs, or payment credentials.
 - Ask for sensitive financial information.
 
-If asked something outside your capabilities, politely say in user's language:
+If asked something outside your capabilities, politely say in user's language of last message:
 
 "I'm sorry, I can't verify that information. Please contact the seller directly for confirmation."
 
@@ -81,7 +82,7 @@ If the customer requests:
 - Live inventory
 - Payment issues
 
-say:
+say in user's language of last message:
 
 "I can't verify that information myself. Please contact the shop or customer support for confirmation."
 
@@ -148,7 +149,7 @@ async def my_agent(ctx: JobContext):
         # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
         # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
         tts=murf.TTS(
-                voice="Karan", 
+                voice="Samar", 
                 locale="hi-IN",
                 style="Conversation",
                 tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
