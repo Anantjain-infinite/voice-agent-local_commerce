@@ -1,3 +1,5 @@
+import { randomUUID } from 'crypto';
+import { cookies } from 'next/headers';
 import { NextResponse } from 'next/server';
 import { AccessToken, type AccessTokenOptions, type VideoGrant } from 'livekit-server-sdk';
 import { RoomConfiguration } from '@livekit/protocol';
@@ -14,6 +16,12 @@ const API_KEY = process.env.LIVEKIT_API_KEY;
 const API_SECRET = process.env.LIVEKIT_API_SECRET;
 const LIVEKIT_URL = process.env.LIVEKIT_URL;
 const AGENT_NAME = process.env.AGENT_NAME;
+
+// Name and lifetime of the cookie that remembers this browser's participant identity,
+// so the same visitor gets the same identity (and therefore the same caller record in
+// the agent's database) across separate calls instead of a new random one every time.
+const PARTICIPANT_IDENTITY_COOKIE = 'bm_participant_identity';
+const PARTICIPANT_IDENTITY_COOKIE_MAX_AGE = 60 * 60 * 24 * 365; // 1 year, in seconds
 
 // don't cache the results
 export const revalidate = 0;
@@ -43,10 +51,24 @@ export async function POST(req: Request) {
         { ignoreUnknownFields: true }
       );
     }
-      
-    // Generate participant token
+
+    // Stable participant identity per browser: reuse it from a cookie if we've seen
+    // this browser before, otherwise mint a new one and remember it for next time.
+    // The room itself can still be a fresh one on every call — only the participant
+    // identity needs to stay the same for the agent to recognize a returning caller.
+    const cookieStore = await cookies();
+    let participantIdentity = cookieStore.get(PARTICIPANT_IDENTITY_COOKIE)?.value;
+    if (!participantIdentity) {
+      participantIdentity = `web_caller_${randomUUID()}`;
+      cookieStore.set(PARTICIPANT_IDENTITY_COOKIE, participantIdentity, {
+        httpOnly: true,
+        sameSite: 'lax',
+        maxAge: PARTICIPANT_IDENTITY_COOKIE_MAX_AGE,
+        path: '/',
+      });
+    }
+
     const participantName = 'user';
-    const participantIdentity = `voice_assistant_user_${Math.floor(Math.random() * 10_000)}`;
     const roomName = `voice_assistant_room_${Math.floor(Math.random() * 10_000)}`;
 
     const participantToken = await createParticipantToken(
