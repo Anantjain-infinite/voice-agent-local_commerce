@@ -19,6 +19,7 @@ from livekit.agents import (
 from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
+import catalogue
 import db
 
 logger = logging.getLogger("agent")
@@ -89,18 +90,43 @@ of your very first greeting, not later. Simply asking for and using their name d
 call does NOT need consent — the CONSENT RULE only applies when you want to save it to the
 database for next time (see PROACTIVELY OFFER TO REMEMBER above).
 
+CATALOGUE & ORDER TOTALS
+You have real catalogue data through two tools — this is now your ONLY source of truth for
+prices and stock. Never state a price, stock status, or order total from memory or a guess.
+
+- lookup_products: call this as soon as a caller names a product or category they're
+  interested in (e.g. "mouse", "atta", "notebooks"), even before they've mentioned a shop
+  or quantity, so you can tell them what's actually available and what it costs.
+- compute_order_total: call this once the caller has given you specific products AND
+  quantities (e.g. "2kg atta and a wireless mouse"). This gives a PRICE ESTIMATE only —
+  it never places or confirms an order (you can never confirm an order yourself, per the
+  GUARDRAILS below).
+
+Both tools return an "as_of" date. Mention it naturally when you quote a price or total
+(e.g. "as of Aug 9, that's ₹449") so the caller knows how fresh the number is — you don't
+need to repeat it on every single sentence, once per quote is enough.
+
+If a tool returns ok: False, the catalogue service is unavailable. Say so plainly and do
+NOT guess a price or stock number instead — e.g. "I can't reach our price list right now,
+please try again in a bit or contact the shop directly." Treat this like the escalation
+script below.
+
+If compute_order_total returns items in "unresolved" (not found, or not enough stock),
+tell the caller specifically which items and why — don't just total up what did resolve
+and stay silent about the rest.
+
 KNOWLEDGE
 You can:
 - Explain products.
 - Recommend products based on user needs.
 - Compare features.
-- Explain general shopping information.
+- Look up real prices and stock via lookup_products, and compute order estimates via
+  compute_order_total (see CATALOGUE & ORDER TOTALS above).
 - Help users understand delivery options if provided.
 - Help locate nearby businesses if information is available.
 
 You cannot:
-- Invent prices.
-- Invent stock availability.
+- State a price or stock status without calling lookup_products or compute_order_total.
 - Invent delivery dates.
 - Confirm an order unless the seller has actually confirmed it.
 - Pretend to access live databases.
@@ -236,6 +262,51 @@ class Assistant(Agent):
             return {"found": False}
         logger.info(f"Identified returning caller by phone {normalized}")
         return {"found": True, **user}
+
+    @function_tool
+    async def lookup_products(
+        self, context: RunContext, query: str, shop: Optional[str] = None
+    ) -> dict:
+        """Look up real price and stock for a product or category in Bazaar Mitra's
+        catalogue.
+
+        ALWAYS call this before telling a caller a specific price or whether something is
+        in stock — never guess or state a remembered price. Call it as soon as the caller
+        names a product or category (e.g. "mouse", "atta", "notebooks"), even before they
+        mention a shop or quantity.
+
+        If the tool result has ok: False, the catalogue service is unavailable right now —
+        tell the caller plainly and do not invent a price or stock number instead.
+
+        Args:
+            query: The product name or category the caller is asking about, e.g.
+                "wireless mouse", "atta", "stationery". Partial names are fine.
+            shop: The shop name to filter to, only if the caller named one specifically.
+        """
+        return await catalogue.lookup_products(query, shop)
+
+    @function_tool
+    async def compute_order_total(self, context: RunContext, items: list[dict]) -> dict:
+        """Compute a price estimate for specific products and quantities, using real
+        catalogue prices and stock. Never calculate or state a total yourself without
+        calling this.
+
+        Call this once the caller has told you specific products AND quantities they want
+        (e.g. "2kg atta and a wireless mouse"). This gives a PRICE ESTIMATE only — it does
+        NOT place or confirm an order (you can never confirm an order yourself).
+
+        If the tool result has ok: False, the catalogue service is unavailable right now —
+        tell the caller plainly and do not invent numbers instead. If it lists items under
+        "unresolved", tell the caller specifically which items couldn't be priced and why
+        (not found, or not enough stock) rather than silently leaving them out.
+
+        Args:
+            items: A list of items, each like {"product": "atta", "quantity": 2, "shop":
+                "Sharma Kirana"}. "shop" is optional per item — omit it to automatically
+                use the cheapest shop that has it. "quantity" is in the product's natural
+                unit (kg, litre, piece, pack, etc.) as returned by lookup_products.
+        """
+        return await catalogue.compute_order_total(items)
 
     # To add more tools, use the @function_tool decorator, following the pattern above.
 

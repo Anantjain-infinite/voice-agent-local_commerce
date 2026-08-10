@@ -1,3 +1,28 @@
+## Day 5 — Catalogue & Order Total Tool
+
+**What it does:** two function tools the agent calls itself —
+- `lookup_products(query, shop?)` — real price & stock for a product/category.
+- `compute_order_total(items)` — prices out a list of {product, quantity, shop?} using
+  real catalogue data, flags anything it couldn't resolve (not found / not enough stock),
+  and never silently invents a number.
+
+**Data source:** there's no public, real-time API for neighbourhood/kirana shop inventory
+in India, so `catalogue.py` uses a small hand-built local dataset (3 example shops,
+~11 products) instead of a live feed. This is called out here per the assignment's
+honesty requirement. The dataset is isolated behind one function, `_fetch_catalogue()`
+in `catalogue.py` — swapping in a real vendor inventory API or POS integration later
+only means rewriting that one function; the tool wiring, timeout handling, and the
+"as of" dating around it don't need to change.
+
+**Freshness:** every response includes an `as_of` date (`CATALOGUE_LAST_UPDATED` in
+`catalogue.py`). The agent is instructed to mention it when quoting a price or total,
+so "yesterday's rate" vs "today's rate" is never ambiguous to the caller.
+
+**Failure handling:** catalogue lookups go through a 3-second timeout. If it's exceeded,
+the tool returns `{"ok": False, "error": "..."}` instead of hanging or returning partial
+data, and the agent is instructed to say the price list is temporarily unreachable rather
+than guess. 
+
 # Voice Agent Starter — Powered by Murf Falcon
 
 Build a production voice AI agent in 5 minutes. Powered by the fastest TTS on the market - swap the system prompt to build anything from customer support to language tutors.
