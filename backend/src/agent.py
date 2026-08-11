@@ -1,8 +1,11 @@
+import json
 import logging
+import os
+import dataclasses
 from typing import Any, Optional
 
 from dotenv import load_dotenv
-from livekit import rtc
+from livekit import api, rtc
 from livekit.agents import (
     Agent,
     AgentServer,
@@ -12,6 +15,7 @@ from livekit.agents import (
     RunContext,
     cli,
     function_tool,
+    get_job_context,
     inference,
     tokenize,
     room_io,
@@ -23,6 +27,10 @@ import catalogue
 import db
 
 logger = logging.getLogger("agent")
+
+# Stored LiveKit outbound trunk ID (looks like "ST_xxxxxxxx"), created once with
+# create_outbound_trunk.py. Required for agent-initiated outbound calls (Day 6).
+OUTBOUND_TRUNK_ID = os.getenv("LIVEKIT_OUTBOUND_TRUNK_ID")
 
 load_dotenv(".env.local")
 
@@ -139,6 +147,24 @@ If they speak only English, reply in English.
 Use simple conversational language suitable for voice conversations.
 Also the text of the response should be in the same language as the user.
 
+OUTBOUND CALLS
+Sometimes YOU are calling the customer, not the other way around — you'll be told this
+explicitly in your opening instructions for that call, along with why you're calling. This
+is different from an inbound call: the person didn't ask for this call and doesn't know who
+you are yet, so open carefully.
+
+Within your very first two sentences, before anything else, you MUST say:
+1. Who is calling — Bazaar Mitra — and which shop it's on behalf of, if you know it.
+2. Why you're calling, specifically (e.g. confirming a particular order).
+3. That they can ask you to stop calling at any time and you'll comply immediately.
+
+Do not wait for them to speak first on an outbound call — you called them, so you open.
+
+If at ANY point — opening or later — the caller says something like "stop calling me",
+"don't call again", "remove my number", or similar: say a brief goodbye acknowledging it,
+then call opt_out_of_calls. Do this immediately, no matter what else is happening in the
+call. This applies on inbound calls too if they ask you to stop calling them in future.
+
 GUARDRAILS
 
 Never:
@@ -150,6 +176,7 @@ Never:
 - Collect passwords, OTPs, PINs, UPI PINs, or payment credentials.
 - Ask for sensitive financial information.
 - Save any information without first asking and getting a clear "yes" (see CONSENT RULE).
+- Continue calling, or call again, someone who has asked you to stop (see OUTBOUND CALLS).
 
 If asked something outside your capabilities, politely say in user's language of last message:
 
@@ -308,6 +335,21 @@ class Assistant(Agent):
         """
         return await catalogue.compute_order_total(items)
 
+    @function_tool
+    async def opt_out_of_calls(self, context: RunContext) -> None:
+        """Mark this caller as do-not-call and end the call.
+
+        Call this if the caller says something like "stop calling me", "don't call
+        again", or "remove my number" — on an outbound call or an inbound one. Before
+        calling this, say a brief goodbye acknowledging you won't call again; the call
+        ends right after you finish speaking, so say that goodbye in the same turn.
+        Future outbound calls to this caller should be skipped after this.
+        """
+        await db.save_user(self.caller_id, facts={"do_not_call": True})
+        logger.info(f"Caller {self.caller_id} opted out of future outbound calls")
+        await context.wait_for_playout()  # let the goodbye finish playing first
+        await _hangup_call()
+
     # To add more tools, use the @function_tool decorator, following the pattern above.
 
 
@@ -352,6 +394,58 @@ def normalize_phone(phone_number: str) -> str:
     still resolves to the same caller record. Tuned for Indian 10-digit mobile numbers."""
     digits = "".join(ch for ch in phone_number if ch.isdigit())
     return digits[-10:] if len(digits) >= 10 else digits
+
+
+async def _hangup_call() -> None:
+    """Ends the call for everyone by deleting the current room."""
+    ctx = get_job_context()
+    if ctx is None:
+        return
+    await ctx.delete_room()
+
+
+def build_outbound_opening(reason: Optional[str], call_context: dict, caller_record: Optional[dict]) -> str:
+    """
+    Build the instructions for the very first thing the agent says on an OUTBOUND call.
+    Encodes the Day 6 rule: within the first two sentences, say who's calling, why, and
+    how to make it stop — before anything else, and without waiting for the caller to
+    speak first.
+    """
+    name = (caller_record or {}).get("name")
+    name_clause = f" ({name})" if name else ""
+    shop = call_context.get("shop", "your local shop")
+
+    if reason == "order_confirmation":
+        order_summary = call_context.get("order_summary", "a recent order")
+        return f"""
+        This is an OUTBOUND call you initiated — the person did not call you and doesn't
+        know who you are yet, so open carefully. Do NOT wait for them to speak first.
+
+        Within your very first two sentences, before anything else, say:
+        1. That this is Bazaar Mitra, calling on behalf of {shop}.
+        2. Why you're calling: to confirm their order — {order_summary}.
+        3. That they can ask you to stop calling at any time and you will (via
+           opt_out_of_calls).
+
+        Example shape (adapt naturally to the caller's likely language{name_clause}):
+        "Namaste, this is Bazaar Mitra calling on behalf of {shop} about your order —
+        {order_summary}. If you'd like me to stop calling, just say so anytime. Do you
+        have a moment to confirm this order?"
+
+        After that opening, listen to their response. You still can't yourself declare
+        the order placed — relay their answer; {shop} finalizes it on their end.
+        """
+
+    # Generic fallback for any other outbound reason value.
+    reason_phrase = reason or "a shopping-related update"
+    return f"""
+    This is an OUTBOUND call you initiated — the person did not call you and doesn't know
+    who you are yet, so open carefully. Do NOT wait for them to speak first.
+
+    Within your very first two sentences, before anything else, say who is calling
+    (Bazaar Mitra, on behalf of {shop}), why you're calling ({reason_phrase}), and that
+    they can ask you to stop calling at any time and you will (via opt_out_of_calls).
+    """
 
 
 @server.rtc_session(agent_name="my-agent")
@@ -411,10 +505,91 @@ async def my_agent(ctx: JobContext):
     # # Start the avatar and wait for it to join
     # await avatar.start(session, room=ctx.room)
 
-    # Join the room and connect to the user first, so we can see who's calling
-    # before we build the Assistant and start the session.
+    # Join the room first, so we can see who's calling (inbound) or place our own
+    # call (outbound) before building the Assistant and starting the session.
     await ctx.connect()
 
+    room_options = room_io.RoomOptions(
+        audio_input=room_io.AudioInputOptions(
+            noise_cancellation=lambda params: (
+                noise_cancellation.BVCTelephony()
+                if params.participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
+                else noise_cancellation.BVC()
+            ),
+        ),
+    )
+
+    # ---- Detect an agent-initiated OUTBOUND call ----
+    # Outbound calls are triggered by dispatching this agent with a phone number (and
+    # why we're calling) in the job metadata — see trigger_outbound_call.py. Inbound
+    # (phone or web) dispatches never set this, so dial_info stays empty for them and
+    # everything below is skipped in favor of the existing inbound flow.
+    dial_info: dict = {}
+    if ctx.job.metadata:
+        try:
+            dial_info = json.loads(ctx.job.metadata)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(f"Could not parse job metadata as JSON: {ctx.job.metadata!r}")
+
+    phone_number = dial_info.get("phone_number")
+
+    if phone_number:
+        # ---------------- OUTBOUND CALL ----------------
+        call_reason = dial_info.get("reason")
+        call_context = dial_info.get("context") or {}
+
+        caller_id = normalize_phone(phone_number)
+        ctx.log_context_fields["caller_id"] = caller_id
+
+        if not OUTBOUND_TRUNK_ID:
+            logger.error("LIVEKIT_OUTBOUND_TRUNK_ID is not set — cannot place outbound call")
+            ctx.shutdown()
+            return
+
+        caller_record = await db.get_user(caller_id)
+        if (caller_record or {}).get("facts", {}).get("do_not_call"):
+            logger.info(f"Skipping outbound call to {caller_id}: marked do-not-call")
+            ctx.shutdown()
+            return
+
+        sip_participant_identity = phone_number
+        try:
+            # This call blocks (wait_until_answered=True) until the phone is actually
+            # picked up, so we never start the session — and never speak — into a
+            # still-ringing or unanswered call.
+            await ctx.api.sip.create_sip_participant(
+                api.CreateSIPParticipantRequest(
+                    room_name=ctx.room.name,
+                    sip_trunk_id=OUTBOUND_TRUNK_ID,
+                    sip_call_to=phone_number,
+                    participant_identity=sip_participant_identity,
+                    wait_until_answered=True,
+                )
+            )
+            logger.info(f"Outbound call to {phone_number} answered")
+        except api.SipCallError as e:
+            # e.g. USER_REJECTED (486/603), USER_UNAVAILABLE (408/480), SIP_TRUNK_FAILURE (5xx)
+            logger.warning(f"Outbound call to {phone_number} failed: {e.sip_status_code} {e.sip_status}")
+            ctx.shutdown()
+            return
+
+        await ctx.wait_for_participant(identity=sip_participant_identity)
+
+        await session.start(
+         agent=Assistant(caller_id=caller_id),
+         room=ctx.room,
+         room_options=dataclasses.replace(
+         room_options, participant_identity=sip_participant_identity
+         ), 
+        )
+
+        # Outbound calls speak first — the callee didn't ask for this call, so we open
+        # with who/why/how-to-stop rather than waiting for them to say something.
+        opening_instructions = build_outbound_opening(call_reason, call_context, caller_record)
+        await session.generate_reply(instructions=opening_instructions)
+        return
+
+    # ---------------- INBOUND CALL (phone or web) ----------------
     caller_id = get_caller_id(ctx)
     ctx.log_context_fields["caller_id"] = caller_id
 
@@ -434,16 +609,7 @@ async def my_agent(ctx: JobContext):
     await session.start(
         agent=Assistant(caller_id=caller_id),
         room=ctx.room,
-        room_options=room_io.RoomOptions(
-            audio_input=room_io.AudioInputOptions(
-                noise_cancellation=lambda params: (
-                    noise_cancellation.BVCTelephony()
-                    if params.participant.kind
-                    == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
-                    else noise_cancellation.BVC()
-                ),
-            ),
-        ),
+        room_options=room_options,
     )
 
     known_name = caller_record.get("name") if caller_record else None

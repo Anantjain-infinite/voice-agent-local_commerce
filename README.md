@@ -1,3 +1,41 @@
+## Day 6 — Outbound Calls
+
+**Use case:** order confirmation — the agent calls a customer back about a specific order
+to confirm it, on behalf of the shop that took it.
+
+**How it works:** `trigger_outbound_call.py` dispatches the agent with the phone number,
+shop, and order summary as job metadata (after checking the local do-not-call list).
+Inside `agent.py`, the entrypoint checks for that metadata: if present, it dials the
+number via `ctx.api.sip.create_sip_participant(...)` and blocks until the call is
+actually picked up (`wait_until_answered=True`) — the agent session is only started
+*after* pickup, so nobody hears a greeting play into a still-ringing phone. If there's
+no phone number in the metadata, the exact same entrypoint falls through to the normal
+inbound (phone or web) flow from Day 4/5, unchanged.
+
+**Opening disclosure (Step 4):** the outbound opening is built by
+`build_outbound_opening()` and instructs the agent that, within its first two sentences,
+it must say who's calling (Bazaar Mitra, on behalf of the shop), why (confirming this
+specific order), and that the caller can ask it to stop at any time. The agent speaks
+first on outbound calls — it doesn't wait for the callee, since they didn't ask for the call.
+
+**Opt-out is enforced, not just promised:** if the caller says "stop calling me" at any
+point, the agent calls `opt_out_of_calls`, which marks `do_not_call: true` in that
+caller's saved facts and ends the call. `trigger_outbound_call.py` checks this flag
+before dialing anyone again, so an opt-out actually prevents future calls rather than
+just being acknowledged in the moment.
+
+**Setup required before this works** (see `create_outbound_trunk.py` and the setup
+notes at the top of it): a Twilio phone number, an Elastic SIP Trunk with a Termination
+URI and credential list, and a LiveKit outbound trunk ID (`ST_xxxx`) referencing them,
+saved as `LIVEKIT_OUTBOUND_TRUNK_ID` in `.env.local`.
+
+**To place a call:**
+```bash
+python trigger_outbound_call.py +919876543210 \
+    --shop "Sharma Kirana" \
+    --order-summary "2kg atta, 1 wireless mouse - Rs. 513"
+```
+
 ## Day 5 — Catalogue & Order Total Tool
 
 **What it does:** two function tools the agent calls itself —
