@@ -25,6 +25,7 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 import catalogue
 import db
+import escalations
 
 logger = logging.getLogger("agent")
 
@@ -177,23 +178,55 @@ Never:
 - Ask for sensitive financial information.
 - Save any information without first asking and getting a clear "yes" (see CONSENT RULE).
 - Continue calling, or call again, someone who has asked you to stop (see OUTBOUND CALLS).
+- Create a human escalation without asking and getting a clear "yes" first (see
+  HUMAN ESCALATION below).
 
 If asked something outside your capabilities, politely say in user's language of last message:
 
 "I'm sorry, I can't verify that information. Please contact the seller directly for confirmation."
 
-Escalation Script
+Escalation Script (for things that just aren't worth a human ticket)
 
-If the customer requests:
-- Order confirmation
-- Refund approval
-- Delivery confirmation
-- Live inventory
-- Payment issues
-
-say in user's language of last message:
+If the customer asks about delivery confirmation, or anything else you genuinely can't
+verify that ISN'T one of the two situations in HUMAN ESCALATION below, say in the
+user's language of last message:
 
 "I can't verify that information myself. Please contact the shop or customer support for confirmation."
+
+HUMAN ESCALATION
+For exactly two situations, don't just give the line above — actively create a request
+for a human to follow up, using the create_escalation tool:
+1. A payment, refund, or order dispute — the caller says they were charged wrong, wants
+   a refund, or disputes what an order should have cost or contained.
+2. The caller explicitly asks to speak to a human, the shop owner, or says something
+   like "I don't want to talk to a bot" / "let me talk to a person".
+
+Nothing else should create an escalation — for anything else unresolved, use the
+Escalation Script above instead.
+
+ESCALATION CONSENT RULE (hard rule, never skip it):
+Before calling create_escalation, tell the caller PLAINLY what you're about to send —
+e.g. "I'll pass along your name, what happened, and how urgent it seems, so someone can
+call you back — is that okay?" — and get a clear "yes". If they say no, do NOT call
+create_escalation; give them the Escalation Script line instead.
+
+When you do create one, gather these (leave genuinely unknown ones as "unknown" —
+never invent them):
+- who needs help: their name if you have it, and a number to reach them if they want a
+  callback
+- what happened: a short, factual summary in your own words — not a transcript
+- what you already checked: e.g. "looked up the order in the catalogue — atta was
+  ₹42/kg as of Aug 9" or "no matching order found in the catalogue"
+- urgency: low / medium / high — your judgment from how they describe it
+- their language preference
+- how they'd like to be followed up with (call back, any time is fine, a specific time)
+NEVER include a password, OTP, PIN, or account number in any of this — you should never
+have collected those from the caller in the first place.
+
+After create_escalation succeeds, it gives you a reference ID — tell the caller that ID
+and what happens next, honestly. E.g. "Someone from the shop will follow up with you —
+I can't promise exactly when, but here's your reference: ESC-0004." Never promise an
+immediate reply unless you actually know that's true.
 
 STYLE
 - Speak naturally.
@@ -350,6 +383,52 @@ class Assistant(Agent):
         await context.wait_for_playout()  # let the goodbye finish playing first
         await _hangup_call()
 
+    @function_tool
+    async def create_escalation(
+        self,
+        context: RunContext,
+        reason: str,
+        what_happened: str,
+        what_agent_checked: str,
+        urgency: str,
+        caller_language: str,
+        preferred_follow_up: str,
+    ) -> dict:
+        """Create a request for a human to follow up with this caller.
+
+        Only call this for (1) a payment, refund, or order dispute, or (2) the caller
+        explicitly asking to speak to a human or the shop owner — and only AFTER you've
+        told the caller what you're about to send and gotten a clear "yes" (see the
+        ESCALATION CONSENT RULE). Never put a password, OTP, PIN, or account number in
+        any argument here.
+
+        Args:
+            reason: Short label for why: "payment_or_order_dispute" or "requested_human".
+            what_happened: A short, factual summary in your own words — not a transcript.
+                E.g. "Caller says they were charged for 2kg atta but only received 1kg."
+            what_agent_checked: What you already looked into, e.g. "Looked up atta in
+                the catalogue — ₹42/kg as of Aug 9 — but can't see delivered quantities."
+            urgency: "low", "medium", or "high" — your judgment from how they describe it.
+            caller_language: The language the caller has been speaking, e.g. "Hindi".
+            preferred_follow_up: How they'd like to be followed up with, e.g. "call back
+                on this number", "any time is fine", "evenings only".
+        """
+        existing = await db.get_user(self.caller_id)
+        caller_name = existing.get("name") if existing else None
+
+        reference_id = await escalations.create_escalation(
+            caller_id=self.caller_id,
+            caller_name=caller_name,
+            reason=reason,
+            what_happened=what_happened,
+            what_agent_checked=what_agent_checked,
+            urgency=urgency,
+            caller_language=caller_language,
+            preferred_follow_up=preferred_follow_up,
+        )
+        logger.info(f"Created escalation {reference_id} for caller {self.caller_id}: {reason}")
+        return {"reference_id": reference_id}
+
     # To add more tools, use the @function_tool decorator, following the pattern above.
 
 
@@ -458,6 +537,7 @@ async def my_agent(ctx: JobContext):
 
     # Make sure the memory database exists before we need it.
     await db.init_db()
+    await escalations.init_db()
 
     # Set up a voice AI pipeline using Murf Falcon, Gemini, Deepgram, and the LiveKit turn detector
     session = AgentSession(

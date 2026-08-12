@@ -1,3 +1,39 @@
+## Day 7 — Know When to Ask for Human Help
+
+**Two triggers, chosen deliberately (not every unresolved question escalates):**
+1. Payment, refund, or order dispute.
+2. Caller explicitly asks to speak to a human or the shop owner.
+
+Everything else the agent can't verify (e.g. delivery dates) still gets the old
+"please contact the shop" line — only these two create an actual ticket.
+
+**Consent is enforced in the prompt, not assumed:** the agent must tell the caller
+what it's about to send and get a clear "yes" before calling `create_escalation` —
+see the ESCALATION CONSENT RULE in `agent.py`'s system prompt. Say no, and it falls
+back to the plain "contact the shop" line instead.
+
+**What gets sent** (never a transcript, never passwords/OTPs/PINs/account numbers):
+who needs help (name + caller ID for callback), a short factual summary of what
+happened, what the agent already checked, urgency (low/medium/high), the caller's
+language, and how they'd like to be followed up with.
+
+**Where it goes:** a local SQLite table (`escalations.py`, same DB file as Day 4's
+caller memory) — no external accounts needed. `dashboard.py` is a small local Flask
+app that lists open/resolved requests and lets you mark one resolved.
+
+**Reference ID:** every escalation gets one like `ESC-0004`, given to the caller as
+their next step, with an honest (not overpromised) description of what happens next.
+
+**To view the dashboard:**
+```bash
+python dashboard.py
+# open http://127.0.0.1:5000
+```
+
+**To test both paths (Step 7):** have one call where you say "I want a refund, I was
+overcharged" (should trigger an escalation, after asking permission) and one normal
+shopping call (should never call `create_escalation`).
+
 ## Day 6 — Outbound Calls
 
 **Use case:** order confirmation — the agent calls a customer back about a specific order
