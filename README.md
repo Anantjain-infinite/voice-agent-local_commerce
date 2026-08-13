@@ -1,3 +1,42 @@
+## Day 8 — Call Analytics Dashboard
+
+**Success definition (Step 1):** per the track table — "the caller finds a product or
+completes an enquiry." Operationalized as: during the call, the agent either (a) found
+real product matches via `lookup_products`, (b) priced a real order via
+`compute_order_total`, or (c) successfully created a human escalation via
+`create_escalation` (Day 7) — since handing an unresolvable problem to a human *is*
+completing the enquiry, matching how the brief treats escalation as success for Health
+Access and Disaster Response. Anything else — caller hangs up with nothing resolved,
+catalogue down and nothing else landed — is recorded as failed. **This is a judgment
+call, not the only valid one** — if you'd rather only count self-serve resolutions as
+success (excluding escalations), that's one line to change in `agent.py`'s
+`create_escalation` tool (remove the `self._mark_outcome("escalated")` call).
+
+**How outcomes get recorded (Step 2):** each `Assistant` instance tracks
+`outcome_achieved` / `outcome_reason` in memory, set by the three tools above (first
+success wins if more than one happens in a call). At call end, a shutdown callback
+(`ctx.add_shutdown_callback`, registered once per call in both the inbound and outbound
+entrypoint branches) writes exactly one row to a new `calls` table via `call_stats.py` —
+same SQLite file as everything else. A call that never actually connects (e.g. outbound
+dial rejected, do-not-call skip) is never counted, since no enquiry could have been
+completed or failed.
+
+**The dashboard (Step 3–4):** `/calls` on the existing Flask app from Day 7 — three big
+numbers (Total / Successful / Failed) pulled live from `call_stats.get_summary()`, plus
+a recent-calls table, auto-refreshing every 15s. Nothing is hardcoded; every number
+reflects whatever's actually in `bazaar_mitra.db`.
+
+**Privacy (Step 6):** `call_stats.list_recent_calls()` doesn't select `caller_id` from
+the database at all — not just hidden in the template, actually excluded from the SQL
+query, so it can't leak onto the page by accident. No transcript, name, or contact info
+of any kind is ever queried for this view.
+
+**To test (Step 5):** run the agent, have a shopping conversation that actually
+resolves (e.g. ask about a real product and get a price), hang up, then refresh
+`/calls` — Total and Successful should both go up by one. A conversation where you hang
+up without asking about anything real should only increase Total and Failed.
+
+
 ## Day 7 — Know When to Ask for Human Help
 
 **Two triggers, chosen deliberately (not every unresolved question escalates):**

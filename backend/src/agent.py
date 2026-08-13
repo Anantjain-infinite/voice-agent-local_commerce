@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-import dataclasses
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from dotenv import load_dotenv
@@ -23,6 +23,7 @@ from livekit.agents import (
 from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
+import call_stats
 import catalogue
 import db
 import escalations
@@ -147,6 +148,9 @@ If they speak only Hindi, reply in Hindi.
 If they speak only English, reply in English.
 Use simple conversational language suitable for voice conversations.
 Also the text of the response should be in the same language as the user.
+Always write every language in its own native script.
+Hindi → Devanagari (नमस्ते), never romanized (never "namaste").
+Same rule for all non-English languages.
 
 OUTBOUND CALLS
 Sometimes YOU are calling the customer, not the other way around — you'll be told this
@@ -244,6 +248,21 @@ class Assistant(Agent):
         # user_id used to look the caller up in / save the caller to the database.
         # Derived once per session from the room/participant (see get_caller_id below).
         self.caller_id = caller_id
+
+        # ---- Day 8: call outcome tracking ----
+        # A call is "successful" if the caller found a real product, priced a real
+        # order, or got escalated to a human — i.e. their enquiry was actually
+        # completed, not necessarily self-served. Set by lookup_products,
+        # compute_order_total, and create_escalation below; read by
+        # record_call_outcome() at the end of the call. See README-day8.md.
+        self.outcome_achieved = False
+        self.outcome_reason: Optional[str] = None
+        self.started_at = datetime.now(timezone.utc)
+
+    def _mark_outcome(self, reason: str) -> None:
+        if not self.outcome_achieved:
+            self.outcome_achieved = True
+            self.outcome_reason = reason
 
     @function_tool
     async def lookup_caller_history(self, context: RunContext) -> dict:
@@ -343,7 +362,10 @@ class Assistant(Agent):
                 "wireless mouse", "atta", "stationery". Partial names are fine.
             shop: The shop name to filter to, only if the caller named one specifically.
         """
-        return await catalogue.lookup_products(query, shop)
+        result = await catalogue.lookup_products(query, shop)
+        if result.get("ok") and result.get("matches"):
+            self._mark_outcome("product_found")
+        return result
 
     @function_tool
     async def compute_order_total(self, context: RunContext, items: list[dict]) -> dict:
@@ -366,7 +388,10 @@ class Assistant(Agent):
                 use the cheapest shop that has it. "quantity" is in the product's natural
                 unit (kg, litre, piece, pack, etc.) as returned by lookup_products.
         """
-        return await catalogue.compute_order_total(items)
+        result = await catalogue.compute_order_total(items)
+        if result.get("ok") and result.get("line_items"):
+            self._mark_outcome("order_priced")
+        return result
 
     @function_tool
     async def opt_out_of_calls(self, context: RunContext) -> None:
@@ -427,6 +452,7 @@ class Assistant(Agent):
             preferred_follow_up=preferred_follow_up,
         )
         logger.info(f"Created escalation {reference_id} for caller {self.caller_id}: {reason}")
+        self._mark_outcome("escalated")
         return {"reference_id": reference_id}
 
     # To add more tools, use the @function_tool decorator, following the pattern above.
@@ -481,6 +507,24 @@ async def _hangup_call() -> None:
     if ctx is None:
         return
     await ctx.delete_room()
+
+
+async def record_call_outcome(assistant: "Assistant", call_id: str, call_type: str) -> None:
+    """
+    Day 8: called once per call, when it ends, to record whether it reached the
+    track's success condition — see Assistant.__init__ for what counts as success.
+    """
+    outcome = "success" if assistant.outcome_achieved else "failed"
+    reason = assistant.outcome_reason or "no_resolution"
+    await call_stats.record_call(
+        call_id=call_id,
+        caller_id=assistant.caller_id,
+        call_type=call_type,
+        outcome=outcome,
+        reason=reason,
+        started_at=assistant.started_at.isoformat(),
+    )
+    logger.info(f"Recorded call outcome: {call_id} ({call_type}) -> {outcome} ({reason})")
 
 
 def build_outbound_opening(reason: Optional[str], call_context: dict, caller_record: Optional[dict]) -> str:
@@ -538,6 +582,7 @@ async def my_agent(ctx: JobContext):
     # Make sure the memory database exists before we need it.
     await db.init_db()
     await escalations.init_db()
+    await call_stats.init_db()
 
     # Set up a voice AI pipeline using Murf Falcon, Gemini, Deepgram, and the LiveKit turn detector
     session = AgentSession(
@@ -653,14 +698,18 @@ async def my_agent(ctx: JobContext):
             ctx.shutdown()
             return
 
-        await ctx.wait_for_participant(identity=sip_participant_identity)
+        participant = await ctx.wait_for_participant(identity=sip_participant_identity)
+
+        outbound_assistant = Assistant(caller_id=caller_id)
+        ctx.add_shutdown_callback(
+            lambda: record_call_outcome(outbound_assistant, call_id=ctx.room.name, call_type="outbound")
+        )
 
         await session.start(
-         agent=Assistant(caller_id=caller_id),
-         room=ctx.room,
-         room_options=dataclasses.replace(
-         room_options, participant_identity=sip_participant_identity
-         ), 
+            agent=outbound_assistant,
+            room=ctx.room,
+            participant=participant,
+            room_options=room_options,
         )
 
         # Outbound calls speak first — the callee didn't ask for this call, so we open
@@ -686,8 +735,12 @@ async def my_agent(ctx: JobContext):
     caller_record = await db.get_user(caller_id)
 
     # Start the session, which initializes the voice pipeline and warms up the models
+    inbound_assistant = Assistant(caller_id=caller_id)
+    ctx.add_shutdown_callback(
+        lambda: record_call_outcome(inbound_assistant, call_id=ctx.room.name, call_type="inbound")
+    )
     await session.start(
-        agent=Assistant(caller_id=caller_id),
+        agent=inbound_assistant,
         room=ctx.room,
         room_options=room_options,
     )
