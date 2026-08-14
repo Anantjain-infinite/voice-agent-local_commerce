@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -10,6 +11,7 @@ from livekit.agents import (
     Agent,
     AgentServer,
     AgentSession,
+    ChatContext,
     JobContext,
     JobProcess,
     RunContext,
@@ -27,6 +29,8 @@ import call_stats
 import catalogue
 import db
 import escalations
+import returns
+import returns_policy
 
 logger = logging.getLogger("agent")
 
@@ -35,6 +39,30 @@ logger = logging.getLogger("agent")
 OUTBOUND_TRUNK_ID = os.getenv("LIVEKIT_OUTBOUND_TRUNK_ID")
 
 load_dotenv(".env.local")
+
+
+@dataclass
+class CallState:
+    """
+    Shared across EVERY agent in the session (the main Assistant, the Returns
+    Specialist, and any future specialist) — this is what survives a Day 9 handoff.
+    Each new Agent subclass instance is otherwise a blank slate with no memory of
+    caller_id or anything else, since handoffs create a fresh instance. Every tool
+    below receives this via RunContext[CallState] instead of storing state on self.
+    """
+
+    caller_id: str = ""
+    outcome_achieved: bool = False
+    outcome_reason: Optional[str] = None
+    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    def mark_outcome(self, reason: str) -> None:
+        # First success wins if more than one happens in a call — keeps the
+        # Day 8 "reason" meaningful instead of just recording the last thing that fired.
+        if not self.outcome_achieved:
+            self.outcome_achieved = True
+            self.outcome_reason = reason
+
 
 # Change this prompt to change what your voice agent does.
 # See README.md for example prompts (customer support, language tutor, receptionist).
@@ -121,9 +149,8 @@ NOT guess a price or stock number instead — e.g. "I can't reach our price list
 please try again in a bit or contact the shop directly." Treat this like the escalation
 script below.
 
-If compute_order_total returns items in "unresolved" (not found, or not enough stock),
-tell the caller specifically which items and why — don't just total up what did resolve
-and stay silent about the rest.
+If compute_order_total returns items in "unresolved", tell the caller specifically which
+items and why — don't just total up what did resolve and stay silent about the rest.
 
 KNOWLEDGE
 You can:
@@ -148,9 +175,6 @@ If they speak only Hindi, reply in Hindi.
 If they speak only English, reply in English.
 Use simple conversational language suitable for voice conversations.
 Also the text of the response should be in the same language as the user.
-Always write every language in its own native script.
-Hindi → Devanagari (नमस्ते), never romanized (never "namaste").
-Same rule for all non-English languages.
 
 OUTBOUND CALLS
 Sometimes YOU are calling the customer, not the other way around — you'll be told this
@@ -169,6 +193,17 @@ If at ANY point — opening or later — the caller says something like "stop ca
 "don't call again", "remove my number", or similar: say a brief goodbye acknowledging it,
 then call opt_out_of_calls. Do this immediately, no matter what else is happening in the
 call. This applies on inbound calls too if they ask you to stop calling them in future.
+
+RETURNS & REFUNDS
+If the caller wants to return an item, asks about the return policy, or asks about a
+refund timeline for something they're returning, use transfer_to_returns_specialist —
+this hands the conversation to a specialist who actually knows the return rules, instead
+of you guessing. Tell the caller you're connecting them first, briefly, e.g. "Sure, let
+me connect you with our returns and refunds specialist" — then call the tool.
+
+Do NOT use this handoff for a payment/order dispute (wrong charge, promised refund never
+arrived) or an explicit request for a human — those still go through create_escalation
+(see HUMAN ESCALATION below), since those genuinely need a person, not another AI.
 
 GUARDRAILS
 
@@ -241,177 +276,53 @@ STYLE
 - If the user is silent, gently ask if they are still there.
 """
 
+RETURNS_SPECIALIST_PROMPT = """
+IDENTITY
+You are the Returns & Refunds Specialist for Bazaar Mitra. You have ONE job: helping
+callers understand and act on the return/refund policy. You are not the general shopping
+assistant — don't try to look up general products or compute order totals, that isn't
+your job; if the caller asks about something outside returns/refunds, say so plainly and
+that you're the returns specialist.
 
-class Assistant(Agent):
-    def __init__(self, caller_id: str) -> None:
-        super().__init__(instructions=SYSTEM_PROMPT)
-        # user_id used to look the caller up in / save the caller to the database.
-        # Derived once per session from the room/participant (see get_caller_id below).
-        self.caller_id = caller_id
+WHAT YOU CAN DO
+- Explain the return policy in plain language when asked (return window, refund method,
+  refund timeline).
+- Check whether a specific item is eligible for return using check_return_eligibility —
+  never guess eligibility yourself, always call the tool. Ask for what's needed (item,
+  how many days since purchase, whether it's been opened/used) if you don't know yet.
+- Start a return request using initiate_return, once you know the item and its
+  eligibility from check_return_eligibility.
+- Escalate to a human via create_escalation if the caller has an actual DISPUTE (e.g.
+  "I already returned this and never got my refund", "you charged me twice") or
+  explicitly asks for a human. Same consent rule as ever: tell them what you're sending
+  and get a clear yes first.
 
-        # ---- Day 8: call outcome tracking ----
-        # A call is "successful" if the caller found a real product, priced a real
-        # order, or got escalated to a human — i.e. their enquiry was actually
-        # completed, not necessarily self-served. Set by lookup_products,
-        # compute_order_total, and create_escalation below; read by
-        # record_call_outcome() at the end of the call. See README-day8.md.
-        self.outcome_achieved = False
-        self.outcome_reason: Optional[str] = None
-        self.started_at = datetime.now(timezone.utc)
+LANGUAGE
+Mirror the caller's language, same as the rest of Bazaar Mitra.
 
-    def _mark_outcome(self, reason: str) -> None:
-        if not self.outcome_achieved:
-            self.outcome_achieved = True
-            self.outcome_reason = reason
+GUARDRAILS
+Never invent an eligibility answer — always call check_return_eligibility. Never promise
+an exact refund date beyond what the tool tells you. Never collect passwords, OTPs, PINs,
+or account numbers.
 
-    @function_tool
-    async def lookup_caller_history(self, context: RunContext) -> dict:
-        """Look up whether this caller has spoken with Bazaar Mitra before.
+STYLE
+Keep responses short and clear, one question at a time — same conversational style as
+the rest of Bazaar Mitra.
+"""
 
-        You already receive a summary of what's known about this caller at the start of
-        the conversation, so you normally do NOT need to call this. Only call it later in
-        the conversation, after the caller has said something, if you need to re-confirm
-        or refresh what's on file (e.g. they ask what you remember about them).
 
-        Returns a dict describing what is on file (name, language_preference, facts,
-        last_interaction), or {"found": False} if there is no record for this caller yet.
-        """
-        user = await db.get_user(self.caller_id)
-        if user is None:
-            logger.info(f"No existing record for caller {self.caller_id}")
-            return {"found": False}
-        logger.info(f"Found existing record for caller {self.caller_id}")
-        return {"found": True, **user}
-
-    @function_tool
-    async def save_caller_info(
-        self,
-        context: RunContext,
-        name: Optional[str] = None,
-        language_preference: Optional[str] = None,
-        facts: Optional[dict[str, Any]] = None,
-    ) -> str:
-        """Save or update what you know about this caller, for future conversations.
-
-        Only call this AFTER you have told the caller you'd like to remember this and they
-        have clearly agreed. Never call this to store passwords, OTPs, PINs, UPI PINs, or
-        other payment/account credentials.
-
-        Args:
-            name: The caller's name, if they shared it and agreed you can remember it.
-            language_preference: Preferred language/locale, e.g. "hi-IN" or "en-IN".
-            facts: Local Commerce facts to remember, e.g. {"past_orders": "2kg atta,
-                1L mustard oil", "usual_quantities": "2kg atta weekly",
-                "preferred_delivery_slot": "evening", "preferred_shop": "Sharma Kirana"}.
-                New values are merged with what is already saved, not replaced.
-        """
-        await db.save_user(
-            self.caller_id,
-            name=name,
-            language_preference=language_preference,
-            facts=facts,
-        )
-        logger.info(f"Saved info for caller {self.caller_id}: name={name}, facts={facts}")
-        return "saved"
-
-    @function_tool
-    async def identify_caller(self, context: RunContext, phone_number: str) -> dict:
-        """Identify (or start tracking) this caller by a phone number they give you.
-
-        Use this when you don't already recognize the caller from the start-of-call
-        context and it would help to recognize them on future calls — for example, they
-        ask "do you remember me?", or they want you to remember details for next time.
-        Ask for their phone number first, get it, then call this tool with it.
-
-        This makes the phone number the caller's stable ID for the rest of THIS call: any
-        later save_caller_info call will save under this phone number, and if a record
-        already existed under this number (from a previous call), you'll get it back here.
-
-        Args:
-            phone_number: The phone number the caller told you, digits as spoken/heard.
-        """
-        normalized = normalize_phone(phone_number)
-        if not normalized:
-            return {"found": False, "error": "that didn't look like a valid phone number"}
-
-        self.caller_id = normalized
-        user = await db.get_user(normalized)
-        if user is None:
-            logger.info(f"No existing record when identifying caller by phone {normalized}")
-            return {"found": False}
-        logger.info(f"Identified returning caller by phone {normalized}")
-        return {"found": True, **user}
-
-    @function_tool
-    async def lookup_products(
-        self, context: RunContext, query: str, shop: Optional[str] = None
-    ) -> dict:
-        """Look up real price and stock for a product or category in Bazaar Mitra's
-        catalogue.
-
-        ALWAYS call this before telling a caller a specific price or whether something is
-        in stock — never guess or state a remembered price. Call it as soon as the caller
-        names a product or category (e.g. "mouse", "atta", "notebooks"), even before they
-        mention a shop or quantity.
-
-        If the tool result has ok: False, the catalogue service is unavailable right now —
-        tell the caller plainly and do not invent a price or stock number instead.
-
-        Args:
-            query: The product name or category the caller is asking about, e.g.
-                "wireless mouse", "atta", "stationery". Partial names are fine.
-            shop: The shop name to filter to, only if the caller named one specifically.
-        """
-        result = await catalogue.lookup_products(query, shop)
-        if result.get("ok") and result.get("matches"):
-            self._mark_outcome("product_found")
-        return result
-
-    @function_tool
-    async def compute_order_total(self, context: RunContext, items: list[dict]) -> dict:
-        """Compute a price estimate for specific products and quantities, using real
-        catalogue prices and stock. Never calculate or state a total yourself without
-        calling this.
-
-        Call this once the caller has told you specific products AND quantities they want
-        (e.g. "2kg atta and a wireless mouse"). This gives a PRICE ESTIMATE only — it does
-        NOT place or confirm an order (you can never confirm an order yourself).
-
-        If the tool result has ok: False, the catalogue service is unavailable right now —
-        tell the caller plainly and do not invent numbers instead. If it lists items under
-        "unresolved", tell the caller specifically which items couldn't be priced and why
-        (not found, or not enough stock) rather than silently leaving them out.
-
-        Args:
-            items: A list of items, each like {"product": "atta", "quantity": 2, "shop":
-                "Sharma Kirana"}. "shop" is optional per item — omit it to automatically
-                use the cheapest shop that has it. "quantity" is in the product's natural
-                unit (kg, litre, piece, pack, etc.) as returned by lookup_products.
-        """
-        result = await catalogue.compute_order_total(items)
-        if result.get("ok") and result.get("line_items"):
-            self._mark_outcome("order_priced")
-        return result
-
-    @function_tool
-    async def opt_out_of_calls(self, context: RunContext) -> None:
-        """Mark this caller as do-not-call and end the call.
-
-        Call this if the caller says something like "stop calling me", "don't call
-        again", or "remove my number" — on an outbound call or an inbound one. Before
-        calling this, say a brief goodbye acknowledging you won't call again; the call
-        ends right after you finish speaking, so say that goodbye in the same turn.
-        Future outbound calls to this caller should be skipped after this.
-        """
-        await db.save_user(self.caller_id, facts={"do_not_call": True})
-        logger.info(f"Caller {self.caller_id} opted out of future outbound calls")
-        await context.wait_for_playout()  # let the goodbye finish playing first
-        await _hangup_call()
+class SharedToolsMixin:
+    """
+    Tools usable from ANY agent in the session, not just one — currently create_escalation
+    and opt_out_of_calls. Mixed into both Assistant and ReturnsSpecialist so a caller who
+    says "stop calling me" or needs a human is never stuck depending on which agent happens
+    to be active. Needs context.userdata (a CallState) at call time, same as every other tool.
+    """
 
     @function_tool
     async def create_escalation(
         self,
-        context: RunContext,
+        context: RunContext[CallState],
         reason: str,
         what_happened: str,
         what_agent_checked: str,
@@ -438,11 +349,12 @@ class Assistant(Agent):
             preferred_follow_up: How they'd like to be followed up with, e.g. "call back
                 on this number", "any time is fine", "evenings only".
         """
-        existing = await db.get_user(self.caller_id)
+        caller_id = context.userdata.caller_id
+        existing = await db.get_user(caller_id)
         caller_name = existing.get("name") if existing else None
 
         reference_id = await escalations.create_escalation(
-            caller_id=self.caller_id,
+            caller_id=caller_id,
             caller_name=caller_name,
             reason=reason,
             what_happened=what_happened,
@@ -451,11 +363,242 @@ class Assistant(Agent):
             caller_language=caller_language,
             preferred_follow_up=preferred_follow_up,
         )
-        logger.info(f"Created escalation {reference_id} for caller {self.caller_id}: {reason}")
-        self._mark_outcome("escalated")
+        logger.info(f"Created escalation {reference_id} for caller {caller_id}: {reason}")
+        context.userdata.mark_outcome("escalated")
         return {"reference_id": reference_id}
 
+    @function_tool
+    async def opt_out_of_calls(self, context: RunContext[CallState]) -> None:
+        """Mark this caller as do-not-call and end the call.
+
+        Call this if the caller says something like "stop calling me", "don't call
+        again", or "remove my number" — on an outbound call or an inbound one. Before
+        calling this, say a brief goodbye acknowledging you won't call again; the call
+        ends right after you finish speaking, so say that goodbye in the same turn.
+        Future outbound calls to this caller should be skipped after this.
+        """
+        caller_id = context.userdata.caller_id
+        await db.save_user(caller_id, facts={"do_not_call": True})
+        logger.info(f"Caller {caller_id} opted out of future outbound calls")
+        await context.wait_for_playout()  # let the goodbye finish playing first
+        await _hangup_call()
+
+
+class Assistant(SharedToolsMixin, Agent):
+    def __init__(self, chat_ctx: ChatContext | None = None) -> None:
+        super().__init__(instructions=SYSTEM_PROMPT, chat_ctx=chat_ctx)
+
+    @function_tool
+    async def lookup_caller_history(self, context: RunContext[CallState]) -> dict:
+        """Look up whether this caller has spoken with Bazaar Mitra before.
+
+        You already receive a summary of what's known about this caller at the start of
+        the conversation, so you normally do NOT need to call this. Only call it later in
+        the conversation, after the caller has said something, if you need to re-confirm
+        or refresh what's on file (e.g. they ask what you remember about them).
+
+        Returns a dict describing what is on file (name, language_preference, facts,
+        last_interaction), or {"found": False} if there is no record for this caller yet.
+        """
+        caller_id = context.userdata.caller_id
+        user = await db.get_user(caller_id)
+        if user is None:
+            logger.info(f"No existing record for caller {caller_id}")
+            return {"found": False}
+        logger.info(f"Found existing record for caller {caller_id}")
+        return {"found": True, **user}
+
+    @function_tool
+    async def save_caller_info(
+        self,
+        context: RunContext[CallState],
+        name: Optional[str] = None,
+        language_preference: Optional[str] = None,
+        facts: Optional[dict[str, Any]] = None,
+    ) -> str:
+        """Save or update what you know about this caller, for future conversations.
+
+        Only call this AFTER you have told the caller you'd like to remember this and they
+        have clearly agreed. Never call this to store passwords, OTPs, PINs, UPI PINs, or
+        other payment/account credentials.
+
+        Args:
+            name: The caller's name, if they shared it and agreed you can remember it.
+            language_preference: Preferred language/locale, e.g. "hi-IN" or "en-IN".
+            facts: Local Commerce facts to remember, e.g. {"past_orders": "2kg atta,
+                1L mustard oil", "usual_quantities": "2kg atta weekly",
+                "preferred_delivery_slot": "evening", "preferred_shop": "Sharma Kirana"}.
+                New values are merged with what is already saved, not replaced.
+        """
+        caller_id = context.userdata.caller_id
+        await db.save_user(caller_id, name=name, language_preference=language_preference, facts=facts)
+        logger.info(f"Saved info for caller {caller_id}: name={name}, facts={facts}")
+        return "saved"
+
+    @function_tool
+    async def identify_caller(self, context: RunContext[CallState], phone_number: str) -> dict:
+        """Identify (or start tracking) this caller by a phone number they give you.
+
+        Use this when you don't already recognize the caller from the start-of-call
+        context and it would help to recognize them on future calls — for example, they
+        ask "do you remember me?", or they want you to remember details for next time.
+        Ask for their phone number first, get it, then call this tool with it.
+
+        This makes the phone number the caller's stable ID for the rest of THIS call: any
+        later save_caller_info call will save under this phone number, and if a record
+        already existed under this number (from a previous call), you'll get it back here.
+
+        Args:
+            phone_number: The phone number the caller told you, digits as spoken/heard.
+        """
+        normalized = normalize_phone(phone_number)
+        if not normalized:
+            return {"found": False, "error": "that didn't look like a valid phone number"}
+
+        context.userdata.caller_id = normalized
+        user = await db.get_user(normalized)
+        if user is None:
+            logger.info(f"No existing record when identifying caller by phone {normalized}")
+            return {"found": False}
+        logger.info(f"Identified returning caller by phone {normalized}")
+        return {"found": True, **user}
+
+    @function_tool
+    async def lookup_products(
+        self, context: RunContext[CallState], query: str, shop: Optional[str] = None
+    ) -> dict:
+        """Look up real price and stock for a product or category in Bazaar Mitra's
+        catalogue.
+
+        ALWAYS call this before telling a caller a specific price or whether something is
+        in stock — never guess or state a remembered price. Call it as soon as the caller
+        names a product or category (e.g. "mouse", "atta", "notebooks"), even before they
+        mention a shop or quantity.
+
+        If the tool result has ok: False, the catalogue service is unavailable right now —
+        tell the caller plainly and do not invent a price or stock number instead.
+
+        Args:
+            query: The product name or category the caller is asking about, e.g.
+                "wireless mouse", "atta", "stationery". Partial names are fine.
+            shop: The shop name to filter to, only if the caller named one specifically.
+        """
+        result = await catalogue.lookup_products(query, shop)
+        if result.get("ok") and result.get("matches"):
+            context.userdata.mark_outcome("product_found")
+        return result
+
+    @function_tool
+    async def compute_order_total(self, context: RunContext[CallState], items: list[dict]) -> dict:
+        """Compute a price estimate for specific products and quantities, using real
+        catalogue prices and stock. Never calculate or state a total yourself without
+        calling this.
+
+        Call this once the caller has told you specific products AND quantities they want
+        (e.g. "2kg atta and a wireless mouse"). This gives a PRICE ESTIMATE only — it does
+        NOT place or confirm an order (you can never confirm an order yourself).
+
+        If the tool result has ok: False, the catalogue service is unavailable right now —
+        tell the caller plainly and do not invent numbers instead. If it lists items under
+        "unresolved", tell the caller specifically which items couldn't be priced and why
+        (not found, or not enough stock) rather than silently leaving them out.
+
+        Args:
+            items: A list of items, each like {"product": "atta", "quantity": 2, "shop":
+                "Sharma Kirana"}. "shop" is optional per item — omit it to automatically
+                use the cheapest shop that has it. "quantity" is in the product's natural
+                unit (kg, litre, piece, pack, etc.) as returned by lookup_products.
+        """
+        result = await catalogue.compute_order_total(items)
+        if result.get("ok") and result.get("line_items"):
+            context.userdata.mark_outcome("order_priced")
+        return result
+
+    @function_tool
+    async def transfer_to_returns_specialist(
+        self, context: RunContext[CallState]
+    ) -> tuple[Agent, str]:
+        """Transfer the conversation to the Returns & Refunds Specialist.
+
+        Call this when the caller wants to return an item, asks about the return policy,
+        or asks about a refund timeline for something they're returning — anything about
+        returning something they already bought.
+
+        Do NOT use this for a payment/order dispute (wrong charge, promised refund never
+        arrived) or an explicit request for a human — those go through create_escalation
+        instead (see HUMAN ESCALATION), since those need an actual person, not another AI.
+        """
+        specialist = ReturnsSpecialist(chat_ctx=self.chat_ctx.copy(exclude_instructions=True))
+        return specialist, "Sure — let me connect you with our returns and refunds specialist."
+
     # To add more tools, use the @function_tool decorator, following the pattern above.
+
+
+class ReturnsSpecialist(SharedToolsMixin, Agent):
+    def __init__(self, chat_ctx: ChatContext | None = None) -> None:
+        super().__init__(instructions=RETURNS_SPECIALIST_PROMPT, chat_ctx=chat_ctx)
+
+    async def on_enter(self) -> None:
+        # Introduces itself after taking over, per Day 9 Step 5 — the caller shouldn't
+        # have to guess that the conversation just changed hands.
+        await self.session.generate_reply(
+            instructions="""
+            Introduce yourself, briefly, as Bazaar Mitra's Returns & Refunds Specialist —
+            one short sentence — then ask what item they'd like to return, or what
+            they'd like to know about the return policy. Don't re-ask anything the
+            caller already told the previous agent; continue naturally from there.
+            """
+        )
+
+    @function_tool
+    async def check_return_eligibility(
+        self,
+        context: RunContext[CallState],
+        item: str,
+        days_since_purchase: int,
+        opened_or_used: bool,
+    ) -> dict:
+        """Check whether an item is eligible for return under Bazaar Mitra's policy.
+
+        Always call this before telling a caller whether their item can be returned —
+        never guess. Ask the caller how many days since purchase, and whether the item
+        has been opened/used, if you don't already know.
+
+        Args:
+            item: What the caller wants to return, e.g. "mustard oil", "wireless mouse".
+            days_since_purchase: How many days ago they bought it.
+            opened_or_used: Whether the item has been opened or used.
+        """
+        category = "general"
+        lookup = await catalogue.lookup_products(item)
+        if lookup.get("ok") and lookup.get("matches"):
+            category = lookup["matches"][0].get("category", "general")
+
+        result = returns_policy.check_eligibility(category, days_since_purchase, opened_or_used)
+        context.userdata.mark_outcome("return_checked")
+        return {**result, "category_used": category, "as_of": returns_policy.POLICY_LAST_UPDATED}
+
+    @function_tool
+    async def initiate_return(
+        self, context: RunContext[CallState], item: str, reason: str, eligible: bool
+    ) -> dict:
+        """Start a return request for an item, after confirming eligibility with
+        check_return_eligibility. Only call this once you know whether it's eligible.
+
+        Args:
+            item: What's being returned.
+            reason: Why the caller is returning it, in their own words.
+            eligible: Whether check_return_eligibility said this item is eligible.
+        """
+        reference_id = await returns.create_return(
+            caller_id=context.userdata.caller_id,
+            item=item,
+            reason=reason,
+            eligible=eligible,
+        )
+        logger.info(f"Created return request {reference_id} for caller {context.userdata.caller_id}")
+        context.userdata.mark_outcome("return_initiated")
+        return {"reference_id": reference_id, "eligible": eligible}
 
 
 server = AgentServer()
@@ -477,8 +620,8 @@ def get_caller_id(ctx: JobContext) -> str:
     NOTE: for web/browser test clients (e.g. a playground that assigns a random
     identity like "voice_assistant_user_1234" on every connection), this fallback is
     NOT stable across calls — that's expected, since there's no phone number to key
-    off of. See the identify_caller tool below for how the agent recovers a stable
-    identity in that situation, by asking the caller directly.
+    off of. See the identify_caller tool for how the agent recovers a stable identity
+    in that situation, by asking the caller directly.
     """
     for participant in ctx.room.remote_participants.values():
         if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
@@ -509,20 +652,22 @@ async def _hangup_call() -> None:
     await ctx.delete_room()
 
 
-async def record_call_outcome(assistant: "Assistant", call_id: str, call_type: str) -> None:
+async def record_call_outcome(state: CallState, call_id: str, call_type: str) -> None:
     """
     Day 8: called once per call, when it ends, to record whether it reached the
-    track's success condition — see Assistant.__init__ for what counts as success.
+    track's success condition — see CallState.mark_outcome() and every tool that calls
+    it. Reads from session.userdata rather than any specific Agent instance, so this is
+    correct even if a Day 9 handoff happened partway through the call.
     """
-    outcome = "success" if assistant.outcome_achieved else "failed"
-    reason = assistant.outcome_reason or "no_resolution"
+    outcome = "success" if state.outcome_achieved else "failed"
+    reason = state.outcome_reason or "no_resolution"
     await call_stats.record_call(
         call_id=call_id,
-        caller_id=assistant.caller_id,
+        caller_id=state.caller_id,
         call_type=call_type,
         outcome=outcome,
         reason=reason,
-        started_at=assistant.started_at.isoformat(),
+        started_at=state.started_at.isoformat(),
     )
     logger.info(f"Recorded call outcome: {call_id} ({call_type}) -> {outcome} ({reason})")
 
@@ -583,9 +728,11 @@ async def my_agent(ctx: JobContext):
     await db.init_db()
     await escalations.init_db()
     await call_stats.init_db()
+    await returns.init_db()
 
     # Set up a voice AI pipeline using Murf Falcon, Gemini, Deepgram, and the LiveKit turn detector
-    session = AgentSession(
+    session = AgentSession[CallState](
+        userdata=CallState(),
         # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
         # See all available models at https://docs.livekit.io/agents/models/stt/
         stt=deepgram.STT(model="nova-3", language="multi"),
@@ -700,13 +847,14 @@ async def my_agent(ctx: JobContext):
 
         participant = await ctx.wait_for_participant(identity=sip_participant_identity)
 
-        outbound_assistant = Assistant(caller_id=caller_id)
+        session.userdata.caller_id = caller_id
+        session.userdata.started_at = datetime.now(timezone.utc)
         ctx.add_shutdown_callback(
-            lambda: record_call_outcome(outbound_assistant, call_id=ctx.room.name, call_type="outbound")
+            lambda: record_call_outcome(session.userdata, call_id=ctx.room.name, call_type="outbound")
         )
 
         await session.start(
-            agent=outbound_assistant,
+            agent=Assistant(),
             room=ctx.room,
             participant=participant,
             room_options=room_options,
@@ -734,13 +882,15 @@ async def my_agent(ctx: JobContext):
     # greeting no longer depends on the model remembering to call the tool.
     caller_record = await db.get_user(caller_id)
 
-    # Start the session, which initializes the voice pipeline and warms up the models
-    inbound_assistant = Assistant(caller_id=caller_id)
+    session.userdata.caller_id = caller_id
+    session.userdata.started_at = datetime.now(timezone.utc)
     ctx.add_shutdown_callback(
-        lambda: record_call_outcome(inbound_assistant, call_id=ctx.room.name, call_type="inbound")
+        lambda: record_call_outcome(session.userdata, call_id=ctx.room.name, call_type="inbound")
     )
+
+    # Start the session, which initializes the voice pipeline and warms up the models
     await session.start(
-        agent=inbound_assistant,
+        agent=Assistant(),
         room=ctx.room,
         room_options=room_options,
     )

@@ -1,3 +1,48 @@
+## Day 9 — Hand Off to a Specialist Agent
+
+**Specialist chosen:** Returns & Refunds Specialist, per the track table. Its job is
+narrow on purpose — explain the return policy, check whether a specific item is
+eligible, start a return request. It does NOT do general shopping (no catalogue lookup,
+no order totals) — if asked, it says so and stays in its lane.
+
+**A bigger change than it looks like:** implementing the handoff surfaced a real bug in
+how Days 4–8 stored state. `caller_id` and the Day 8 outcome-tracking flags used to live
+as plain attributes on the `Assistant` instance (`self.caller_id`, etc.). A handoff
+creates a *new* Agent instance (the specialist) — so those attributes would have been
+silently lost the moment a handoff happened, breaking memory and analytics for any call
+that used a specialist. Fixed by moving all of that into `session.userdata` (a
+`CallState` dataclass), which is shared across every agent in the session — this is
+LiveKit's own recommended pattern for exactly this problem. Every tool now takes
+`context: RunContext[CallState]` and reads/writes `context.userdata` instead of `self`.
+Days 4–8 behavior is unchanged from the outside; only where the state lives changed.
+
+**Shared tools via mixin:** `create_escalation` and `opt_out_of_calls` moved into a
+`SharedToolsMixin` that both `Assistant` and `ReturnsSpecialist` inherit from — so a
+caller can still ask for a human, or ask to stop being called, no matter which agent is
+currently active.
+
+**The handoff itself (Step 3–5):** `transfer_to_returns_specialist` on the main
+`Assistant` returns `(ReturnsSpecialist(chat_ctx=self.chat_ctx.copy(...)), message)` —
+the tuple-return pattern hands off control, the message is what the caller hears as the
+transition, and passing `chat_ctx` means the specialist sees the prior conversation and
+doesn't make the caller repeat themselves (Step 4). `ReturnsSpecialist.on_enter()`
+introduces itself immediately after taking over (Step 5).
+
+**Boundary with Day 7:** don't confuse this with `create_escalation`. The specialist
+handoff is for ordinary return/refund questions the AI can actually answer (policy,
+eligibility, starting a return). An actual *dispute* (wrong charge, refund promised but
+never received) or an explicit request for a human still goes straight to
+`create_escalation` — a specialist AI can't resolve those, only a person can.
+
+**Data:** `returns_policy.py` is a small hand-built policy (7-day window, groceries
+non-returnable once opened) — same honesty note as `catalogue.py`, no real policy API
+exists to connect to. `returns.py` stores return requests the same way `escalations.py`
+stores escalations (`RET-0001` style references).
+
+**To test (Step 6):** ask a normal shopping question first ("what's the price of a
+wireless mouse") — should stay with the main agent. Then say "I want to return this" —
+should hand off, with the specialist introducing itself and picking up from context.
+
 ## Day 8 — Call Analytics Dashboard
 
 **Success definition (Step 1):** per the track table — "the caller finds a product or
